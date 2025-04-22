@@ -54,7 +54,7 @@ function init() {
     do
         arr=(${rule//,/ })
         cidr=${arr[0]}
-        nextHop=${arr[1]}
+        nextHop=${arr[${#arr[@]}-1]}
 
         exec_cmd "ip route replace $cidr via $nextHop dev eth0"
     done
@@ -144,6 +144,7 @@ function add_eip() {
         exec_cmd "ip route replace default via $gateway dev net1"
         ip route | grep "default via $gateway dev net1"
         exec_cmd "arping -I net1 -c 3 -D $eip_without_prefix"
+        exec_cmd "arping -I net1 -c 3 -A $eip_without_prefix"
     done
 }
 
