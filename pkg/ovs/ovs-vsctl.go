@@ -407,6 +407,22 @@ func ClearPortQosBinding(ifaceID string) error {
 	return nil
 }
 
+// remove qos related to this port.
+func ClearPortQosBindingByName(ifaceID string) error {
+	interfaceList, err := ovsFind("interface", "name", "name="+ifaceID)
+	if err != nil {
+		klog.Error(err)
+		return err
+	}
+
+	for _, ifName := range interfaceList {
+		if err = ovsClear("port", ifName, "qos"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func ListExternalIDs(table string) (map[string]string, error) {
 	args := []string{"--data=bare", "--format=csv", "--no-heading", "--columns=_uuid,external_ids", "find", table, "external_ids:iface-id!=[]"}
 	output, err := Exec(args...)

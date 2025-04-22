@@ -5,8 +5,10 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +75,30 @@ func GetNodeInternalIP(node v1.Node) (ipv4, ipv6 string) {
 	}
 
 	return SplitStringIP(strings.Join(ips, ","))
+}
+
+// GetInterfaceSpeed 获取指定网卡的带宽值（单位为 Mb/s）
+func GetInterfaceSpeed(interfaceName string) (int, error) {
+	ifName := ""
+	if strings.HasPrefix(interfaceName, "br-") {
+		ifName = strings.TrimPrefix(interfaceName, "br-")
+	}
+
+	// 读取 /sys/class/net/<interface>/speed 文件
+	data, err := ioutil.ReadFile(fmt.Sprintf("/sys/class/net/%s/speed", ifName))
+	if err != nil {
+		return 0, fmt.Errorf("failed to read speed for interface %s: %v", ifName, err)
+	}
+
+	// 去除换行符并转换为整数
+	speedStr := strings.TrimSpace(string(data))
+	speed, err := strconv.Atoi(speedStr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse speed for interface %s: %v", ifName, err)
+	}
+
+	// 返回带宽值（Mbps）
+	return speed, nil
 }
 
 func ServiceClusterIPs(svc v1.Service) []string {

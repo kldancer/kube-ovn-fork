@@ -3,6 +3,8 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
+	"gopkg.in/yaml.v3"
 	"io/fs"
 	"net"
 	"os"
@@ -11,6 +13,8 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -669,6 +673,96 @@ func (c *Controller) handlePod(key string) error {
 	return nil
 }
 
+func (c *Controller) handleAddOrUpdateConfigmap(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
+		return nil
+	}
+	klog.Infof("handle add or update configmap %s/%s", namespace, name)
+	cm, err := c.configMapsLister.ConfigMaps(namespace).Get(name)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	reserveBandwidth, mark, _ := resolveClusterNetworkReserveBandwidthConfig(cm)
+
+	if err := c.initClusterNetworkReserveBandwidth(reserveBandwidth, mark); err != nil {
+		return err
+	}
+
+	if err := c.initTunnelIfBandwidth(reserveBandwidth); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) initClusterNetworkReserveBandwidth(reserveBandwidth, mark int) error {
+	pn, err := getProviderNetwork(c.providerNetworksLister, c.config.Iface)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return err
+	}
+	if pn != nil {
+		if reserveBandwidth > 0 {
+			err = ovs.SetInterfaceEgressBandwidth(pn.Name, reserveBandwidth, c.config.IfaceSpeed, mark)
+			if err != nil {
+				return err
+			}
+		} else {
+			err = ovs.SetInterfaceEgressBandwidth(pn.Name, 0, c.config.IfaceSpeed, mark)
+			if err != nil {
+				return err
+			}
+		}
+
+	}
+	return nil
+}
+
+func (c *Controller) initTunnelIfBandwidth(reserveBandwidth int) error {
+	if c.config.IfaceSpeed-reserveBandwidth > 0 {
+		ifName := "genev_sys_6081"
+		klog.Infof("init %s bandwidth,ifName", ifName)
+		if err := util.DeleteNodeIfTc(ifName); err != nil {
+			klog.Warningf("failed to delete %s tc %v", ifName, err)
+		}
+		if reserveBandwidth > 0 {
+			if err := util.EnsureNodeIfTc(ifName, c.config.IfaceSpeed-reserveBandwidth); err != nil {
+				klog.Errorf("failed to ensure %s tc %v", ifName, err)
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Controller) handleDeleteConfigmap(cm *v1.ConfigMap) error {
+	klog.Infof("handle delete configmap %s/%s", cm.Namespace, cm.Name)
+	pn, err := getProviderNetwork(c.providerNetworksLister, c.config.Iface)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return err
+	}
+	if pn != nil {
+		err = ovs.SetInterfaceEgressBandwidth(pn.Name, 0, c.config.IfaceSpeed, 0)
+		if err != nil {
+			return err
+		}
+	}
+
+	reserveBandwidth, _, _ := resolveClusterNetworkReserveBandwidthConfig(cm)
+	if c.config.IfaceSpeed-reserveBandwidth > 0 {
+		if err := util.DeleteNodeIfTc("genev_sys_6081"); err != nil {
+			klog.Errorf("failed to delete node if tc %v", err)
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (c *Controller) loopEncapIPCheck() {
 	node, err := c.nodesLister.Get(c.config.NodeName)
 	if err != nil {
@@ -873,4 +967,52 @@ func isFile(filename, dir string) (bool, string) {
 		klog.Errorf("error when walking the path %q: %v", dir, err)
 	}
 	return isFile, fileFullName
+}
+
+func resolveClusterNetworkReserveBandwidthConfig(cm *v1.ConfigMap) (reserveBandwidth, mark int, ports []int) {
+	if bw, ok := cm.Data["bandwidth"]; ok {
+		var err error
+		reserveBandwidth, err = strconv.Atoi(bw)
+		if err != nil {
+			klog.Errorf("failed to convert bandwidth to int: %v", err)
+		}
+	}
+
+	if markStr, ok := cm.Data["mark"]; ok {
+		var err error
+		mark, err = strconv.Atoi(markStr)
+		if err != nil {
+			klog.Errorf("failed to convert mark to int: %v", err)
+		}
+	} else {
+		mark = util.DefaultClusterNetworkMark
+	}
+
+	ports = make([]int, 0)
+	if portStr, ok := cm.Data["port"]; ok {
+		err := yaml.Unmarshal([]byte(portStr), &ports)
+		if err != nil {
+			klog.Errorf("failed to parse port YAML %q: %w", portStr, err) // Use %w
+			ports = []int{}
+		}
+	}
+	sort.Ints(ports)
+	return
+}
+
+func getProviderNetwork(pnl kubeovnlister.ProviderNetworkLister, interfaceName string) (*kubeovnv1.ProviderNetwork, error) {
+	ifName := ""
+	if strings.HasPrefix(interfaceName, "br-") {
+		ifName = strings.TrimPrefix(interfaceName, "br-")
+	}
+
+	pn, err := pnl.Get(ifName)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return nil, err
+	}
+	return pn, nil
+}
+
+func isClusterNetworkReserveBandwidthCm(cm *v1.ConfigMap) bool {
+	return cm.Namespace == "kube-system" && cm.Name == util.ClusterNetworkReserveBandwidth
 }

@@ -1121,6 +1121,12 @@ func (c *Controller) initResourceOnce() {
 		}
 	}
 
+	if c.config.EnableClusterNetworkBandwidthReserve {
+		if err := c.initClusterNetworkBandwidthReserveConfigMap(); err != nil {
+			util.LogFatalAndExit(err, "failed to initialize cluster network bandwidth reserve")
+		}
+	}
+
 	// remove resources in ovndb that not exist any more in kubernetes resources
 	// process gc at last in case of affecting other init process
 	if err := c.gc(); err != nil {

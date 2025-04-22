@@ -10,6 +10,19 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+const (
+	ovsTableQos          = "qos"
+	ovsTableQueue        = "queue"
+	ovsColumnOtherConfig = "other_config"
+	ovsColumnExternalIDs = "external-ids"
+	ovsKeyMaxRate        = "max-rate"
+	ovsKeyMinRate        = "min-rate"
+	ovsKeyIfaceID        = "iface-id" // Key within external-ids
+
+	defaultQueueIndexSuffix = "-0"
+	clusterQueueIndexSuffix = "-1"
+)
+
 // SetInterfaceBandwidth set ingress/egress qos for given pod, annotation values are for node/pod
 // but ingress/egress parameters here are from the point of ovs port/interface view, so reverse input parameters when call func SetInterfaceBandwidth
 func SetInterfaceBandwidth(podName, podNamespace, iface, ingress, egress string) error {
@@ -82,6 +95,112 @@ func SetInterfaceBandwidth(podName, podNamespace, iface, ingress, egress string)
 			return err
 		}
 	}
+	return nil
+}
+
+func SetInterfaceEgressBandwidth(iface string, clusterNetworkBandwidth, maxBandwidth, mark int) error {
+	klog.Infof("Set interface %s egress clusterNetwork bandwidth [%d] maxBandwidth [%d]", iface, clusterNetworkBandwidth, maxBandwidth)
+
+	qosIfaceUIDMap, err := ListExternalIDs(ovsTableQos)
+	if err != nil {
+		klog.Error(err)
+		return err
+	}
+
+	queueIfaceUIDMap, err := ListExternalIDs(ovsTableQueue)
+	if err != nil {
+		klog.Error(err)
+		return err
+	}
+
+	queueIdList := make([]string, 0)
+
+	clusterNetworkBandwidthBPS := clusterNetworkBandwidth * 1000 * 1000
+	maxBandwidthBPS := maxBandwidth * 1000 * 1000
+
+	if clusterNetworkBandwidthBPS > maxBandwidthBPS {
+		klog.Warningf("clusterNetworkBandwidthBPS %d can not  greater than maxBandwidthBPS %d, skip...", clusterNetworkBandwidthBPS, maxBandwidthBPS)
+		clusterNetworkBandwidthBPS = maxBandwidthBPS
+	}
+
+	defaultBandwidthBPS := 0
+	if clusterNetworkBandwidthBPS > 0 {
+		defaultBandwidthBPS = maxBandwidthBPS - clusterNetworkBandwidthBPS
+	}
+
+	if defaultBandwidthBPS > 0 {
+		queueIdList, err = SetClusterNetworkHtbQosQueueRecord(iface, defaultBandwidthBPS, clusterNetworkBandwidthBPS, queueIfaceUIDMap)
+		if err != nil {
+			klog.Error(err)
+			return err
+		}
+		if err = SetQosMultipleQueueBinding(iface, queueIdList, qosIfaceUIDMap, maxBandwidthBPS); err != nil {
+			return err
+		}
+
+		if err := util.AddIfTcFilter(iface, uint32(mark)); err != nil {
+			klog.Errorf("failed to add tc filter: %v", err)
+		}
+
+	}
+
+	qosUID, qosExists := qosIfaceUIDMap[iface]
+	if defaultBandwidthBPS <= 0 {
+		if qosExists {
+			klog.Infof("The default network bandwidth cannot be less than or equal to 0! clear the existing queue")
+			if err := removeQueueRateLimit(qosUID, "0"); err != nil {
+				return err
+			}
+
+			if err := removeQueueRateLimit(qosUID, "1"); err != nil { // Pass index "1"
+				return err
+			}
+			// 如果带宽不存在，则删除 Qos 和 Queue 记录
+			if err = CheckAndUpdateClusterNetworkHtbQos(iface, queueIfaceUIDMap); err != nil {
+				klog.Errorf("failed to check/update htb qos for iface %s: %v", iface, err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func removeQueueRateLimit(qosUID string, queueIndex string) error {
+	qosType, err := ovsGet(ovsTableQos, qosUID, "type", "")
+	if err != nil {
+		klog.Error(err)
+		return err // Or wrap error
+	}
+	// 假设只有 HTB 类型需要此清理
+	if qosType != util.HtbQos {
+		klog.Infof("QoS type is %s, not HTB. Skipping rate removal for queue index %s.", qosType, queueIndex)
+		return nil
+	}
+
+	queueID, err := ovsGet(ovsTableQos, qosUID, ovsTableQueue, queueIndex)
+	if err != nil {
+		klog.Errorf("Failed to get queue ID for index %s on qos %s: %v", queueIndex, qosUID, err)
+		return err
+	}
+
+	// 在尝试删除之前检查 queueID 是否有效
+	if queueID == "" || queueID == "0" { // Example check, adjust based on ovsGet behavior
+		klog.Warningf("No valid queue found for index %s on qos %s .", queueIndex, qosUID)
+		return nil
+	}
+
+	_, err = Exec("remove", ovsTableQueue, queueID, ovsColumnOtherConfig, ovsKeyMaxRate)
+	if err != nil {
+		return fmt.Errorf("failed to remove max-rate limit for queue %s (index %s) : %w", queueID, queueIndex, err)
+	}
+
+	_, err = Exec("remove", ovsTableQueue, queueID, ovsColumnOtherConfig, ovsKeyMinRate)
+	if err != nil {
+		return fmt.Errorf("failed to remove min-rate limit for queue %s (index %s): %w", queueID, queueIndex, err)
+	}
+
+	klog.Infof("Successfully removed max-rate、min-rate for queue %s (index %s)", queueID, queueIndex)
 	return nil
 }
 
@@ -168,6 +287,70 @@ func SetHtbQosQueueRecord(podName, podNamespace, iface string, maxRateBPS int, q
 	return queueIfaceUIDMap[iface], nil
 }
 
+// SetClusterNetworkHtbQosQueueRecord 确保接口存在两条 OVS 队列记录，一条用于默认流量，一条用于集群网络流量，配置了指定的带宽.
+//
+// 利用缓存 （queueIfaceUIDMap） 来查找现有记录，并在创建新记录时更新它。
+// 返回包含两个队列 [defaultUUID， clusterUUID] 的 UUID 的切片。
+func SetClusterNetworkHtbQosQueueRecord(iface string, defaultBandwidthBPS, clusterNetworkBandwidthBPS int, queueIfaceUIDMap map[string]string) ([]string, error) {
+	queueIdList := make([]string, 2) // Pre-allocate slice for 2 UUIDs
+	var err error
+
+	queueIdList[0], err = ensureOvsQueueRecord(iface, defaultQueueIndexSuffix, defaultBandwidthBPS, queueIfaceUIDMap)
+	if err != nil {
+		return nil, err // Return immediately on first error
+	}
+
+	queueIdList[1], err = ensureOvsQueueRecord(iface, clusterQueueIndexSuffix, clusterNetworkBandwidthBPS, queueIfaceUIDMap)
+	if err != nil {
+		return nil, err // Return immediately on second error
+	}
+
+	// Both queues ensured successfully
+	return queueIdList, nil
+}
+
+// ensureOvsQueueRecord 为接口和索引创建或更新特定的 OVS 队列记录.
+//
+// 如果 bandwidthBPS > 0，则设置 max-rate 和 min-rate。
+// 确保 external-ids：iface-id 标签存在。
+// 使用队列的 UUID 更新 queueCache 映射。
+// 返回队列 UUID 和错误（如果发生）。
+func ensureOvsQueueRecord(iface, queueIndexSuffix string, bandwidthBPS int, queueCache map[string]string) (string, error) {
+	queueKey := iface + queueIndexSuffix
+	ovsArgs := []string{} // Arguments for ovsSet or ovsCreate
+
+	if bandwidthBPS > 0 {
+		maxRateStr := strconv.Itoa(bandwidthBPS)
+		minRateStr := strconv.Itoa(bandwidthBPS)
+		ovsArgs = append(ovsArgs, fmt.Sprintf("%s:%s=%s", ovsColumnOtherConfig, ovsKeyMaxRate, maxRateStr))
+		ovsArgs = append(ovsArgs, fmt.Sprintf("%s:%s=%s", ovsColumnOtherConfig, ovsKeyMinRate, minRateStr))
+	}
+
+	if queueUID, ok := queueCache[queueKey]; ok {
+		klog.V(4).Infof("Queue record found for key %s (UUID: %s). Updating...", queueKey, queueUID)
+		if len(ovsArgs) > 0 {
+			if err := ovsSet(ovsTableQueue, queueUID, ovsArgs...); err != nil {
+				return "", fmt.Errorf("failed to set OVS queue config for existing record %s (key: %s): %w", queueUID, queueKey, err)
+			}
+			klog.V(4).Infof("Successfully updated OVS queue %s for key %s with args: %v", queueUID, queueKey, ovsArgs)
+		} else {
+			klog.V(4).Infof("No rate updates required for existing OVS queue %s (key: %s) as bandwidth is <= 0.", queueUID, queueKey)
+		}
+		return queueUID, nil // Return existing UUID
+	} else {
+		klog.V(4).Infof("No queue record found for key %s. Creating...", queueKey)
+		ovsArgs = append(ovsArgs, fmt.Sprintf("%s:%s=%s", ovsColumnExternalIDs, ovsKeyIfaceID, queueKey))
+
+		queueUUID, err := ovsCreate(ovsTableQueue, ovsArgs...)
+		if err != nil {
+			return "", fmt.Errorf("failed to create OVS queue for key %s with args %v: %w", queueKey, ovsArgs, err)
+		}
+		queueCache[queueKey] = queueUUID
+		klog.V(4).Infof("Successfully created OVS queue for key %s (UUID: %s) with args: %v", queueKey, queueUUID, ovsArgs)
+		return queueUUID, nil
+	}
+}
+
 // SetQosQueueBinding set qos related to queue record.
 func SetQosQueueBinding(podName, podNamespace, ifName, iface, queueUID string, qosIfaceUIDMap map[string]string) error {
 	var qosCommandValues []string
@@ -207,6 +390,58 @@ func SetQosQueueBinding(podName, podNamespace, ifName, iface, queueUID string, q
 				return err
 			}
 			if queueID == queueUID {
+				return nil
+			}
+		}
+
+		if err := ovsSet("qos", qosUID, qosCommandValues...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func SetQosMultipleQueueBinding(iface string, queueUIDs []string, qosIfaceUIDMap map[string]string, maxBandWidth int) error {
+	var qosCommandValues []string
+	for i, q := range queueUIDs {
+		qosCommandValues = append(qosCommandValues, fmt.Sprintf("queues:%d=%s", i, q))
+	}
+
+	if qosUID, ok := qosIfaceUIDMap[iface]; !ok {
+		qosCommandValues = append(qosCommandValues, "type=linux-htb", fmt.Sprintf(`external-ids:iface-id="%s"`, iface))
+		qosCommandValues = append(qosCommandValues, fmt.Sprintf("other-config:max-rate=%d", maxBandWidth))
+		qos, err := ovsCreate("qos", qosCommandValues...)
+		if err != nil {
+			klog.Error(err)
+			return err
+		}
+		err = ovsSet("port", iface, fmt.Sprintf("qos=%s", qos))
+		if err != nil {
+			klog.Error(err)
+			return err
+		}
+		qosIfaceUIDMap[iface] = qos
+	} else {
+		qosType, err := ovsGet("qos", qosUID, "type", "")
+		if err != nil {
+			klog.Error(err)
+			return err
+		}
+		if qosType != util.HtbQos {
+			klog.Errorf("netem qos exists for iface %s, conflict with current qos, will be changed to htb qos", iface)
+			qosCommandValues = append(qosCommandValues, "type=linux-htb")
+		}
+
+		if qosType == util.HtbQos {
+			for i, q := range queueUIDs {
+				queueID, err := ovsGet("qos", qosUID, "queues", strconv.Itoa(i))
+				if err != nil {
+					klog.Error(err)
+					return err
+				}
+				if queueID != q {
+					break
+				}
 				return nil
 			}
 		}
@@ -420,5 +655,47 @@ func CheckAndUpdateHtbQos(podName, podNamespace, ifaceID string, queueIfaceUIDMa
 		klog.Errorf("failed to delete htbqos queue: %v", err)
 		return err
 	}
+	return nil
+}
+
+func CheckAndUpdateClusterNetworkHtbQos(ifaceID string, queueIfaceUIDMap map[string]string) error {
+	if htbQos, _ := IsHtbQos(ifaceID); !htbQos {
+		return nil
+	}
+
+	if err := ClearPortQosBindingByName(ifaceID); err != nil {
+		klog.Errorf("failed to delete qos binding info: %v", err)
+		return err
+	}
+
+	if err := ClearPodBandwidth("", "", ifaceID); err != nil {
+		klog.Errorf("failed to delete htbqos record: %v", err)
+		return err
+	}
+
+	for i := 0; i < 2; i++ {
+		queueKey := ifaceID + fmt.Sprintf("-%d", i)
+		var queueUID string
+		var ok bool
+		if queueUID, ok = queueIfaceUIDMap[queueKey]; !ok {
+			return nil
+		}
+
+		config, err := ovsGet(ovsTableQueue, queueUID, "other_config", "")
+		if err != nil {
+			klog.Errorf("failed to get other_config for queueID %s: %v", queueUID, err)
+			return err
+		}
+		// 带宽或优先级存在，无法删除 QoS
+		if config != "{}" {
+			continue
+		}
+
+		if err := ClearHtbQosQueue("", "", queueKey); err != nil {
+			klog.Errorf("failed to delete htbqos queue: %v", err)
+			return err
+		}
+	}
+
 	return nil
 }

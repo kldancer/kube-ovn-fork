@@ -268,6 +268,7 @@ const (
 	Output                     = "OUTPUT"
 	OvnPrerouting              = "OVN-PREROUTING"
 	OvnPostrouting             = "OVN-POSTROUTING"
+	OvnBandwidthPostrouting    = "OVN-BADNWIDTH-POSTROUTING"
 	OvnOutput                  = "OVN-OUTPUT"
 	OvnMasquerade              = "OVN-MASQUERADE"
 	OvnNatOutGoingPolicy       = "OVN-NAT-POLICY"
@@ -286,4 +287,7 @@ const (
 	U2OFilterOpenFlowPriority = 10000
 	U2OFilterOpenFlowCookieV4 = 0x1000
 	U2OFilterOpenFlowCookieV6 = 0x1001
+
+	ClusterNetworkReserveBandwidth = "cluster-network-reserve-bandwidth"
+	DefaultClusterNetworkMark      = 10
 )

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -58,6 +59,11 @@ type Controller struct {
 	nodesLister listerv1.NodeLister
 	nodesSynced cache.InformerSynced
 
+	configMapsLister          listerv1.ConfigMapLister
+	configMapsSynced          cache.InformerSynced
+	addOrUpdateConfigmapQueue workqueue.RateLimitingInterface
+	deleteConfigmapQueue      workqueue.RateLimitingInterface
+
 	recorder record.EventRecorder
 
 	protocol string
@@ -70,7 +76,7 @@ type Controller struct {
 }
 
 // NewController init a daemon controller
-func NewController(config *Configuration, stopCh <-chan struct{}, podInformerFactory, nodeInformerFactory informers.SharedInformerFactory, kubeovnInformerFactory kubeovninformer.SharedInformerFactory) (*Controller, error) {
+func NewController(config *Configuration, stopCh <-chan struct{}, podInformerFactory, nodeInformerFactory, configMapInformerFactory informers.SharedInformerFactory, kubeovnInformerFactory kubeovninformer.SharedInformerFactory) (*Controller, error) {
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: config.KubeClient.CoreV1().Events("")})
@@ -82,6 +88,7 @@ func NewController(config *Configuration, stopCh <-chan struct{}, podInformerFac
 	vlanInformer := kubeovnInformerFactory.Kubeovn().V1().Vlans()
 	podInformer := podInformerFactory.Core().V1().Pods()
 	nodeInformer := nodeInformerFactory.Core().V1().Nodes()
+	configMapInformer := configMapInformerFactory.Core().V1().ConfigMaps()
 
 	controller := &Controller{
 		config: config,
@@ -109,6 +116,11 @@ func NewController(config *Configuration, stopCh <-chan struct{}, podInformerFac
 		nodesLister: nodeInformer.Lister(),
 		nodesSynced: nodeInformer.Informer().HasSynced,
 
+		configMapsLister:          configMapInformer.Lister(),
+		configMapsSynced:          configMapInformer.Informer().HasSynced,
+		addOrUpdateConfigmapQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "AddOrUpdateConfigmap"),
+		deleteConfigmapQueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DeleteConfigmap"),
+
 		recorder: recorder,
 		k8sExec:  k8sexec.New(),
 	}
@@ -125,11 +137,12 @@ func NewController(config *Configuration, stopCh <-chan struct{}, podInformerFac
 
 	podInformerFactory.Start(stopCh)
 	nodeInformerFactory.Start(stopCh)
+	configMapInformerFactory.Start(stopCh)
 	kubeovnInformerFactory.Start(stopCh)
 
 	if !cache.WaitForCacheSync(stopCh,
 		controller.providerNetworksSynced, controller.subnetsSynced,
-		controller.podsSynced, controller.nodesSynced, controller.vlanSynced) {
+		controller.podsSynced, controller.nodesSynced, controller.vlanSynced, controller.configMapsSynced) {
 		util.LogFatalAndExit(nil, "failed to wait for caches to sync")
 	}
 
@@ -157,7 +170,13 @@ func NewController(config *Configuration, stopCh <-chan struct{}, podInformerFac
 	}); err != nil {
 		return nil, err
 	}
-
+	if _, err = configMapInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    controller.enqueueAddConfigmap,
+		UpdateFunc: controller.enqueueUpdateConfigmap,
+		DeleteFunc: controller.enqueueDeleteConfigmap,
+	}); err != nil {
+		return nil, err
+	}
 	return controller, nil
 }
 
@@ -328,6 +347,20 @@ func (c *Controller) initProviderNetwork(pn *kubeovnv1.ProviderNetwork, node *v1
 		klog.Errorf("failed to update labels of node %s: %v", node.Name, err)
 		return err
 	}
+
+	if pn.Spec.DefaultInterface == c.config.Iface {
+		cm, _ := c.configMapsLister.ConfigMaps("kube-system").Get(util.ClusterNetworkReserveBandwidth)
+		if cm != nil {
+			var key string
+			var err error
+			if key, err = cache.MetaNamespaceKeyFunc(cm); err == nil {
+				c.addOrUpdateConfigmapQueue.Add(key)
+			} else {
+				utilruntime.HandleError(err)
+			}
+		}
+	}
+
 	c.recordProviderNetworkErr(pn.Name, "")
 	return nil
 }
@@ -594,6 +627,125 @@ func (c *Controller) markAndCleanInternalPort() error {
 	return nil
 }
 
+func (c *Controller) enqueueAddConfigmap(obj interface{}) {
+	cm := obj.(*v1.ConfigMap)
+	if isClusterNetworkReserveBandwidthCm(cm) {
+		var key string
+		var err error
+		if key, err = cache.MetaNamespaceKeyFunc(cm); err == nil {
+			klog.Infof("enqueue add cm %s", key)
+			c.addOrUpdateConfigmapQueue.Add(key)
+		} else {
+			utilruntime.HandleError(err)
+		}
+	}
+}
+
+func (c *Controller) enqueueUpdateConfigmap(oldObj, newObj interface{}) {
+	oldCm := oldObj.(*v1.ConfigMap)
+	newCm := newObj.(*v1.ConfigMap)
+	if isClusterNetworkReserveBandwidthCm(oldCm) && isClusterNetworkReserveBandwidthCm(newCm) {
+		var needUpdate bool
+		oldReserveBandwidth, oldMark, oldPorts := resolveClusterNetworkReserveBandwidthConfig(oldCm)
+		newReserveBandwidth, newMark, newPorts := resolveClusterNetworkReserveBandwidthConfig(newCm)
+
+		if !reflect.DeepEqual(oldReserveBandwidth, newReserveBandwidth) ||
+			!reflect.DeepEqual(oldMark, newMark) ||
+			!reflect.DeepEqual(oldPorts, newPorts) {
+			needUpdate = true
+		}
+
+		if needUpdate {
+			klog.Infof("update configmap %s/%s", newCm.Namespace, newCm.Name)
+			var key string
+			var err error
+			if key, err = cache.MetaNamespaceKeyFunc(newCm); err == nil {
+				klog.Infof("enqueue update cm %s", key)
+				c.addOrUpdateConfigmapQueue.Add(key)
+			} else {
+				utilruntime.HandleError(err)
+			}
+		}
+	}
+}
+
+func (c *Controller) enqueueDeleteConfigmap(obj interface{}) {
+	cm := obj.(*v1.ConfigMap)
+	if isClusterNetworkReserveBandwidthCm(cm) {
+		klog.Infof("enqueue delete cm %s-%s", cm.Namespace, cm.Name)
+		c.deleteConfigmapQueue.Add(cm)
+	}
+}
+
+func (c *Controller) runAddOrUpdateConfigmapWorker() {
+	for c.processNextAddOrUpdateConfigmapWorkItem() {
+	}
+}
+
+func (c *Controller) runDeleteConfigmapWorker() {
+	for c.processNextDeleteConfigmapWorkItem() {
+	}
+}
+
+func (c *Controller) processNextAddOrUpdateConfigmapWorkItem() bool {
+	obj, shutdown := c.addOrUpdateConfigmapQueue.Get()
+	if shutdown {
+		return false
+	}
+
+	err := func(obj interface{}) error {
+		defer c.addOrUpdateConfigmapQueue.Done(obj)
+		var key string
+		var ok bool
+		if key, ok = obj.(string); !ok {
+			c.addOrUpdateConfigmapQueue.Forget(obj)
+			utilruntime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
+			return nil
+		}
+		if err := c.handleAddOrUpdateConfigmap(key); err != nil {
+			return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error())
+		}
+
+		c.addOrUpdateConfigmapQueue.Forget(obj)
+		return nil
+	}(obj)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return true
+	}
+	return true
+}
+
+func (c *Controller) processNextDeleteConfigmapWorkItem() bool {
+	obj, shutdown := c.deleteConfigmapQueue.Get()
+	if shutdown {
+		return false
+	}
+
+	err := func(obj interface{}) error {
+		defer c.deleteConfigmapQueue.Done(obj)
+		var cm *v1.ConfigMap
+		var ok bool
+		if cm, ok = obj.(*v1.ConfigMap); !ok {
+			c.deleteConfigmapQueue.Forget(obj)
+			utilruntime.HandleError(fmt.Errorf("expected configmap in workqueue but got %#v", obj))
+			return nil
+		}
+
+		if err := c.handleDeleteConfigmap(cm); err != nil {
+			return fmt.Errorf("error syncing '%s': %s, requeuing", cm.Name, err.Error())
+		}
+
+		c.deleteConfigmapQueue.Forget(obj)
+		return nil
+	}(obj)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return true
+	}
+	return true
+}
+
 // Run starts controller
 func (c *Controller) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
@@ -618,6 +770,8 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	go wait.Until(c.runDeleteProviderNetworkWorker, time.Second, stopCh)
 	go wait.Until(c.runSubnetWorker, time.Second, stopCh)
 	go wait.Until(c.runPodWorker, time.Second, stopCh)
+	go wait.Until(c.runAddOrUpdateConfigmapWorker, time.Second, stopCh)
+	go wait.Until(c.runDeleteConfigmapWorker, time.Second, stopCh)
 	go wait.Until(c.runGateway, 3*time.Second, stopCh)
 	go wait.Until(c.loopEncapIPCheck, 3*time.Second, stopCh)
 	go wait.Until(c.ovnMetricsUpdate, 3*time.Second, stopCh)

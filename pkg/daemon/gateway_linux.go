@@ -723,6 +723,24 @@ func (c *Controller) setIptables() error {
 				}
 			}
 		}
+
+		if protocol == kubeovnv1.ProtocolIPv4 {
+			cm, _ := c.configMapsLister.ConfigMaps("kube-system").Get(util.ClusterNetworkReserveBandwidth)
+			if cm != nil {
+				reserveBandwidth, mark, ports := resolveClusterNetworkReserveBandwidthConfig(cm)
+				if reserveBandwidth > 0 && reserveBandwidth < c.config.IfaceSpeed {
+					pn, err := getProviderNetwork(c.providerNetworksLister, c.config.Iface)
+					if err != nil && !k8serrors.IsNotFound(err) {
+						return err
+					}
+					if pn != nil {
+						_rules := getClusterNetworkBandwidthRules(pn, c.config.IfaceCIDR, ports, mark)
+						iptablesRules = append(iptablesRules, _rules...)
+					}
+				}
+			}
+		}
+
 		var natPreroutingRules, natPostroutingRules, ovnMasqueradeRules, manglePostroutingRules []util.IPTableRule
 		for _, rule := range iptablesRules {
 			if rule.Table == NAT {
@@ -802,6 +820,11 @@ func (c *Controller) setIptables() error {
 			klog.Errorf("failed to update chain %s/%s: %v", MANGLE, OvnPostrouting, err)
 			return err
 		}
+		//
+		//if err = c.updateIptablesChain(ipt, MANGLE, OvnBandwidthPostrouting, Postrouting, clusterNetworkBandwidtManglePostroutingRules); err != nil {
+		//	klog.Errorf("failed to update chain %s/%s: %v", MANGLE, OvnBandwidthPostrouting, err)
+		//	return err
+		//}
 
 		if err = c.cleanObsoleteIptablesRules(protocol, obsoleteRules); err != nil {
 			klog.Errorf("failed to clean legacy iptables rules: %v", err)
@@ -1618,6 +1641,33 @@ func (c *Controller) ipsetExists(name string) (bool, error) {
 	}
 
 	return util.ContainsString(sets, name), nil
+}
+
+func getClusterNetworkBandwidthRules(pn *kubeovnv1.ProviderNetwork, cidr string, ports []int, mark int) []util.IPTableRule {
+	rules := make([]util.IPTableRule, 0)
+
+	portStr := ""
+	ifName := "br-" + pn.Spec.DefaultInterface
+	for _, port := range ports {
+		if portStr == "" {
+			portStr = fmt.Sprintf("%d", port)
+			continue
+		}
+		portStr += fmt.Sprintf(",%d", port)
+	}
+
+	markCode := fmt.Sprintf("0x%x/0xffffffff", mark)
+
+	rules = append(rules,
+		util.IPTableRule{Table: MANGLE, Chain: OvnPostrouting, Rule: strings.Fields(fmt.Sprintf(`-s %s -o %s -p tcp -m multiport --sports %s -j MARK --set-xmark %s`, cidr, ifName, portStr, markCode))})
+	rules = append(rules,
+		util.IPTableRule{Table: MANGLE, Chain: OvnPostrouting, Rule: strings.Fields(fmt.Sprintf(`-s %s -o %s -p tcp -m multiport --dports %s -j MARK --set-xmark %s`, cidr, ifName, portStr, markCode))})
+	rules = append(rules,
+		util.IPTableRule{Table: MANGLE, Chain: OvnPostrouting, Rule: strings.Fields(fmt.Sprintf(`-d %s -o %s -p tcp -m multiport --sports %s -j MARK --set-xmark %s`, cidr, ifName, portStr, markCode))})
+	rules = append(rules,
+		util.IPTableRule{Table: MANGLE, Chain: OvnPostrouting, Rule: strings.Fields(fmt.Sprintf(`-d %s -o %s -p tcp -m multiport --dports %s -j MARK --set-xmark %s`, cidr, ifName, portStr, markCode))})
+
+	return rules
 }
 
 func getNatOutGoingPolicyRuleIPSetName(ruleID, srcOrDst, protocol string, hasPrefix bool) string {

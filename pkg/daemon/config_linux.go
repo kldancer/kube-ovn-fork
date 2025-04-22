@@ -50,6 +50,25 @@ func getIfaceByIP(ip string) (string, int, error) {
 	return "", 0, fmt.Errorf("failed to find interface by address %s", ip)
 }
 
+func getDistCIDRByRoutes(iface *net.Interface) (string, error) {
+	link, err := netlink.LinkByName(iface.Name)
+	if err != nil {
+		return "", fmt.Errorf("failed to get link %s: %v", iface.Name, err)
+	}
+	routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return "", fmt.Errorf("failed to get routes on link %s: %v", iface.Name, err)
+	}
+	distIps := ""
+	for _, r := range routes {
+		if r.Dst != nil && r.Scope == netlink.SCOPE_LINK {
+			distIps = r.Dst.String()
+			break
+		}
+	}
+	return distIps, nil
+}
+
 func (config *Configuration) initRuntimeConfig(_ *corev1.Node) error {
 	// nothing to do on Linux
 	return nil

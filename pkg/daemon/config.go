@@ -31,6 +31,8 @@ type Configuration struct {
 	// interface being used for tunnel
 	tunnelIface               string
 	Iface                     string
+	IfaceSpeed                int
+	IfaceCIDR                 string
 	DPDKTunnelIface           string
 	MTU                       int
 	MSS                       int
@@ -216,6 +218,18 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 			klog.Errorf("failed to get interface by IP %s: %v", encapIP, err)
 			return err
 		}
+
+		ifaceNet, err := findInterface(config.Iface)
+		if err != nil {
+			klog.Errorf("failed to find iface %s, %v", config.Iface, err)
+			return err
+		}
+
+		distCIDR, err := getDistCIDRByRoutes(ifaceNet)
+		if err != nil {
+			return fmt.Errorf("failed to get dist cidr by routes on interface %s: %v", ifaceNet.Name, err)
+		}
+		config.IfaceCIDR = distCIDR
 	} else {
 		tunnelNic := config.Iface
 		if brName := nicBridgeMappings[tunnelNic]; brName != "" {
@@ -232,6 +246,13 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 		if err != nil {
 			return fmt.Errorf("failed to get src IPs by routes on interface %s: %v", iface.Name, err)
 		}
+
+		distCIDR, err := getDistCIDRByRoutes(iface)
+		if err != nil {
+			return fmt.Errorf("failed to get dist cidr by routes on interface %s: %v", iface.Name, err)
+		}
+		config.IfaceCIDR = distCIDR
+
 		addrs, err := iface.Addrs()
 		if err != nil {
 			return fmt.Errorf("failed to get iface addr. %v", err)
@@ -265,6 +286,9 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 		mtu = iface.MTU
 		config.tunnelIface = iface.Name
 	}
+
+	config.IfaceSpeed, _ = util.GetInterfaceSpeed(config.Iface)
+	klog.Infof("Iface %s Speed: %v Mb/s", config.Iface, config.IfaceSpeed)
 
 	encapIsIPv6 := util.CheckProtocol(encapIP) == kubeovnv1.ProtocolIPv6
 	if encapIsIPv6 && runtime.GOOS == "windows" {

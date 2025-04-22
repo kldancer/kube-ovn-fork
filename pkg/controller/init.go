@@ -4,6 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/vishvananda/netlink"
+	"gopkg.in/yaml.v3"
+	"net"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -821,4 +826,81 @@ func (c *Controller) initNodeChassis() error {
 		}
 	}
 	return nil
+}
+
+func (c *Controller) initClusterNetworkBandwidthReserveConfigMap() error {
+	klog.Info("start to init clusterNetwork BandwidthReserve cm")
+	// get vpc nat gateway enable state
+	cm, err := c.configMapsLister.ConfigMaps("kube-system").Get(util.ClusterNetworkReserveBandwidth)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		klog.Errorf("failed to get %s, %v", util.ClusterNetworkReserveBandwidth, err)
+		return err
+	}
+
+	if k8serrors.IsNotFound(err) {
+		hostname, err := os.Hostname()
+		if err != nil {
+			klog.Errorf("failed to get hostname, %v", err)
+			return err
+		}
+
+		node, err := c.nodesLister.Get(hostname)
+		if err != nil {
+			return err
+		}
+		netIf := ""
+		internalIP, _ := util.GetNodeInternalIP(*node)
+		if netIf, _, err = getIfaceByIP(internalIP); err != nil {
+			klog.Errorf("failed to get interface by IP %s: %v", internalIP, err)
+			return err
+		}
+		netIfSpeed, _ := util.GetInterfaceSpeed(netIf)
+		reserve := int(float64(netIfSpeed) * 0.2)
+
+		klog.Infof("netIf: %s internalIP: %s netIfSpeed: %d reserve: %d", netIf, internalIP, netIfSpeed, reserve)
+
+		portsYaml, err := yaml.Marshal(c.config.ClusterNetworkPorts)
+		if err != nil {
+			klog.Errorf("failed to marshal cluster network ports: %v", err)
+			return err
+		}
+
+		cm = &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      util.ClusterNetworkReserveBandwidth,
+				Namespace: "kube-system",
+			},
+			Data: map[string]string{
+				"bandwidth": strconv.Itoa(reserve),
+				"port":      string(portsYaml),
+			},
+		}
+
+		_, err = c.config.KubeClient.CoreV1().ConfigMaps("kube-system").Create(context.Background(), cm, metav1.CreateOptions{})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getIfaceByIP(ip string) (string, int, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return "", 0, err
+	}
+
+	for _, link := range links {
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to get addresses of link %s: %v", link.Attrs().Name, err)
+		}
+		for _, addr := range addrs {
+			if addr.IPNet.Contains(net.ParseIP(ip)) && addr.IP.String() == ip {
+				return link.Attrs().Name, link.Attrs().MTU, nil
+			}
+		}
+	}
+
+	return "", 0, fmt.Errorf("failed to find interface by address %s", ip)
 }
